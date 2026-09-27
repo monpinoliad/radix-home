@@ -1,0 +1,313 @@
+// Pixel clock + weather over a sky that follows the real time of day.
+// On bin night the bins to put out stand on the grass (src/bins.rs decides which).
+// All art comes from tools/gen_sprites.py, pre-scaled so Slint blits it 1:1.
+// Holding BOOT opens Wi-Fi setup, which shows how to join the setup hotspot.
+
+import { PixelFont } from "font/text.slint";
+
+// A line of the uppercase pixel font; `glyphs` are indices from `setup::glyphs` in Rust.
+component PixelText {
+    in property <[int]> glyphs;
+    property <length> advance: 12px;
+    width: glyphs.length * advance;
+    height: 16px;
+
+    for glyph[i] in glyphs: Image {
+        source: PixelFont.glyphs[glyph];
+        x: i * root.advance;
+        y: 0px;
+    }
+}
+
+export component AppWindow inherits Window {
+    width: 240px;
+    height: 240px;
+    background: #000000;
+
+    // ---- Set from Rust (src/bin/main.rs) ----
+    in property <bool> time-valid: false;
+    in property <int> hours;
+    in property <int> minutes;
+    in property <bool> colon-on: true;
+    in property <int> sky-phase: 2;         // 0 night, 1 dawn, 2 day, 3 dusk
+    in property <bool> moon-visible: false; // sunset -> sunrise
+    in property <bool> weather-valid: false;
+    in property <int> weather-icon;         // index into `weather-icons`
+    in property <int> temperature;          // degrees C, rounded
+    in property <[int]> bins;               // due tonight: indices into `bin-images`
+    in property <[int]> bin-label;          // "BIN NIGHT" in `PixelFont` glyphs
+    in property <[int]> status;             // e.g. "JOINING WI-FI"; empty once online
+
+    // Wi-Fi setup screen: replaces the clock and weather.
+    in property <bool> setup-mode: false;
+    in property <[int]> setup-line-1;
+    in property <[int]> setup-line-2;
+    in property <[int]> setup-line-3;
+    in property <[int]> setup-line-4;
+    in property <[int]> setup-footer;
+
+    // ---- Sky ----
+    // 5 flat bands per phase, top to bottom: pixel-art gradient.
+    property <int> sky-bands: 5;
+    property <length> band-height: 40px;
+    property <[color]> sky-colors: [
+        #0b1030, #10183f, #16214f, #1c2b60, #233670, // night
+        #2e3a7a, #5a4f96, #a0609a, #e0807a, #ffb07a, // dawn
+        #4aa3f0, #62b3f6, #7cc2fa, #97d0fd, #b3dfff, // day
+        #1f2560, #4a3a80, #8a4a88, #d0606a, #f59060, // dusk
+    ];
+    property <[color]> ground-colors: [#2c5a3a, #5f9a55, #7cc26b, #4f8048];
+    property <[color]> ground-shade-colors: [#1f4029, #4a7a42, #5c9a4e, #3c6436];
+
+    property <[{x: length, y: length, blink: bool}]> stars: [
+        { x: 52px, y: 56px, blink: false },
+        { x: 186px, y: 50px, blink: true },
+        { x: 30px, y: 118px, blink: true },
+        { x: 208px, y: 104px, blink: false },
+        { x: 44px, y: 156px, blink: false },
+        { x: 214px, y: 148px, blink: true },
+        { x: 96px, y: 10px, blink: true },
+        { x: 148px, y: 8px, blink: false },
+    ];
+    property <bool> twinkle: true;
+
+    // The moon circles just inside the rim, clockwise from the left, and dips behind the ground.
+    property <duration> moon-lap-time: 90s;
+    property <duration> moon-step-time: 100ms;
+    property <int> moon-steps-per-lap: moon-lap-time / moon-step-time;
+    property <int> moon-step: 0;
+    property <angle> moon-angle: 180deg + 360deg * moon-step / moon-steps-per-lap;
+    property <length> moon-orbit: 104px;
+    property <length> moon-size: 20px;
+
+    // ---- Clock + weather glyphs ----
+    property <[image]> big-digits: [
+        @image-url("font/big/0.png"), @image-url("font/big/1.png"), @image-url("font/big/2.png"),
+        @image-url("font/big/3.png"), @image-url("font/big/4.png"), @image-url("font/big/5.png"),
+        @image-url("font/big/6.png"), @image-url("font/big/7.png"), @image-url("font/big/8.png"),
+        @image-url("font/big/9.png"),
+    ];
+    property <[image]> small-digits: [
+        @image-url("font/small/0.png"), @image-url("font/small/1.png"), @image-url("font/small/2.png"),
+        @image-url("font/small/3.png"), @image-url("font/small/4.png"), @image-url("font/small/5.png"),
+        @image-url("font/small/6.png"), @image-url("font/small/7.png"), @image-url("font/small/8.png"),
+        @image-url("font/small/9.png"),
+    ];
+    // Same order as ICONS in tools/gen_sprites.py and Weather::icon in src/weather.rs.
+    property <[image]> weather-icons: [
+        @image-url("weather/clear_day.png"),
+        @image-url("weather/clear_night.png"),
+        @image-url("weather/partly_day.png"),
+        @image-url("weather/partly_night.png"),
+        @image-url("weather/cloudy.png"),
+        @image-url("weather/fog.png"),
+        @image-url("weather/rain.png"),
+        @image-url("weather/snow.png"),
+        @image-url("weather/storm.png"),
+    ];
+
+    // Clock: 4x font, digits 24px wide, colon 8px, 4px gaps -> 120px, centred.
+    property <length> clock-y: 44px;
+    property <[length]> clock-digit-x: [60px, 88px, 128px, 156px];
+    property <length> clock-colon-x: 116px;
+    property <[int]> clock-digits: [
+        Math.floor(hours / 10), Math.mod(hours, 10),
+        Math.floor(minutes / 10), Math.mod(minutes, 10),
+    ];
+
+    // Weather row: 36px icon, 6px gap, then e.g. "-12°" in the 3x font (3px gaps), centred.
+    property <length> weather-y: 84px;
+    property <length> glyph-gap: 3px;
+    property <length> small-digit-width: 18px;
+    property <length> small-symbol-width: 12px; // minus, degree
+    property <int> temp-abs: Math.min(abs(temperature), 99);
+    property <bool> temp-negative: temperature < 0;
+    property <bool> temp-two-digits: temp-abs >= 10;
+    property <length> temp-sign-width: temp-negative ? small-symbol-width + glyph-gap : 0px;
+    property <length> temp-digits-width: temp-two-digits ? 2 * small-digit-width + glyph-gap : small-digit-width;
+    property <length> weather-row-width: 36px + 6px + temp-sign-width + temp-digits-width + glyph-gap + small-symbol-width;
+    property <length> weather-row-x: Math.round((root.width - weather-row-width) / 2 / 1px) * 1px;
+    property <length> temp-x: weather-row-x + 42px + temp-sign-width;
+
+    // ---- Bins ----
+    // Same order as BINS in src/bins.rs.
+    property <[image]> bin-images: [
+        @image-url("bins/red.png"),
+        @image-url("bins/green.png"),
+        @image-url("bins/yellow.png"),
+    ];
+    property <length> bin-width: 48px;
+    property <length> bin-height: 60px;
+    property <length> bin-gap: 12px;
+    property <length> bins-x: (root.width - root.bins.length * (bin-width + bin-gap) + bin-gap) / 2;
+
+    property <length> ground-y: 196px;
+
+    // Moon orbit.
+    Timer {
+        interval: root.moon-step-time;
+        running: root.moon-visible;
+        triggered => {
+            root.moon-step = Math.mod(root.moon-step + 1, root.moon-steps-per-lap);
+        }
+    }
+
+    // Star twinkle.
+    Timer {
+        interval: 700ms;
+        running: root.sky-phase == 0;
+        triggered => {
+            root.twinkle = !root.twinkle;
+        }
+    }
+
+    // ---- Sky ----
+    for band in root.sky-bands: Rectangle {
+        y: band * root.band-height;
+        height: root.band-height;
+        background: root.sky-colors[root.sky-phase * root.sky-bands + band];
+    }
+
+    if root.sky-phase == 0: Rectangle {
+        for star in root.stars: Rectangle {
+            x: star.x;
+            y: star.y;
+            width: 4px;
+            height: 4px;
+            background: #fff6cc;
+            visible: !star.blink || root.twinkle;
+        }
+    }
+
+    if root.moon-visible: Image {
+        source: @image-url("sky/moon.png");
+        width: root.moon-size;
+        height: root.moon-size;
+        // Snapped to the moon's 2px pixel grid.
+        x: Math.round((root.width / 2 + root.moon-orbit * Math.cos(root.moon-angle) - self.width / 2) / 2px) * 2px;
+        y: Math.round((root.height / 2 + root.moon-orbit * Math.sin(root.moon-angle) - self.height / 2) / 2px) * 2px;
+    }
+
+    // ---- Ground ----
+    Rectangle {
+        y: root.ground-y - 4px;
+        height: root.height - self.y;
+        background: root.ground-colors[root.sky-phase];
+    }
+
+    // ---- Weather ----
+    if root.weather-valid && !root.setup-mode: Rectangle {
+        Image {
+            source: root.weather-icons[root.weather-icon];
+            x: root.weather-row-x;
+            y: root.weather-y;
+        }
+
+        if root.temp-negative: Image {
+            source: @image-url("font/small/minus.png");
+            x: root.weather-row-x + 42px;
+            y: root.weather-y + 6px;
+        }
+
+        if root.temp-two-digits: Image {
+            source: root.small-digits[Math.floor(root.temp-abs / 10)];
+            x: root.temp-x;
+            y: root.weather-y + 6px;
+        }
+
+        Image {
+            source: root.small-digits[Math.mod(root.temp-abs, 10)];
+            x: root.temp-x + (root.temp-two-digits ? root.small-digit-width + root.glyph-gap : 0px);
+            y: root.weather-y + 6px;
+        }
+
+        Image {
+            source: @image-url("font/small/degree.png");
+            x: root.temp-x + root.temp-digits-width + root.glyph-gap;
+            y: root.weather-y + 6px;
+        }
+    }
+
+    // ---- Bins (wheels just on the grass, label below) ----
+    if !root.setup-mode: Rectangle {
+        for bin[i] in root.bins: Rectangle {
+            x: root.bins-x + i * (root.bin-width + root.bin-gap);
+            y: root.ground-y - root.bin-height + 4px;
+            width: root.bin-width;
+            height: root.bin-height;
+
+            Rectangle {
+                x: 4px;
+                y: parent.height - 8px;
+                width: parent.width - 8px;
+                height: 4px;
+                background: root.ground-shade-colors[root.sky-phase];
+            }
+
+            Image {
+                source: root.bin-images[bin];
+            }
+        }
+
+        if root.bins.length > 0: PixelText {
+            glyphs: root.bin-label;
+            x: Math.round((root.width - self.width) / 2 / 2px) * 2px;
+            y: 206px;
+        }
+    }
+
+    // ---- Clock (--:-- until the time is synced) ----
+    for i in 4: Image {
+        source: root.time-valid ? root.big-digits[root.clock-digits[i]] : @image-url("font/big/minus.png");
+        x: root.clock-digit-x[i] + (root.time-valid ? 0px : 4px);
+        y: root.clock-y;
+        visible: !root.setup-mode;
+    }
+
+    Image {
+        source: @image-url("font/big/colon.png");
+        x: root.clock-colon-x;
+        y: root.clock-y;
+        visible: !root.setup-mode && (!root.time-valid || root.colon-on);
+    }
+
+    // ---- Wi-Fi status (until the first connection) ----
+    if !root.setup-mode && root.status.length > 0: PixelText {
+        glyphs: root.status;
+        x: Math.round((root.width - self.width) / 2 / 2px) * 2px;
+        y: 122px; // between the weather row and the bin lids
+    }
+
+    // ---- Wi-Fi setup text (lines in the sky, footer on the ground) ----
+    if root.setup-mode: Rectangle {
+        PixelText {
+            glyphs: root.setup-line-1;
+            x: Math.round((root.width - self.width) / 2 / 2px) * 2px;
+            y: 28px;
+        }
+
+        PixelText {
+            glyphs: root.setup-line-2;
+            x: Math.round((root.width - self.width) / 2 / 2px) * 2px;
+            y: 52px;
+        }
+
+        PixelText {
+            glyphs: root.setup-line-3;
+            x: Math.round((root.width - self.width) / 2 / 2px) * 2px;
+            y: 72px;
+        }
+
+        PixelText {
+            glyphs: root.setup-line-4;
+            x: Math.round((root.width - self.width) / 2 / 2px) * 2px;
+            y: 92px;
+        }
+
+        PixelText {
+            glyphs: root.setup-footer;
+            x: Math.round((root.width - self.width) / 2 / 2px) * 2px;
+            y: 204px;
+        }
+    }
+}

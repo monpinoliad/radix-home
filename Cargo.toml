@@ -9,14 +9,47 @@ name = "radix-home"
 path = "./src/bin/main.rs"
 
 [dependencies]
-esp-hal = { version = "~1.2.2", features = ["esp32s3"] }
-
+esp-hal = { version = "~1.2.2", features = ["esp32s3", "log-04", "unstable"] }
 
 esp-bootloader-esp-idf = { version = "0.6.0", features = ["esp32s3"] }
 
 critical-section = "1.2.0"
 esp-alloc        = { version = "0.11.0", features = ["esp32s3"] }
+esp-backtrace    = { version = "0.20.0", features = ["esp32s3", "panic-handler", "println"] }
+esp-println      = { version = "0.18.0", features = ["esp32s3", "log-04"] }
+log              = "0.4"
 
+# Display (GC9A01 over SPI)
+embedded-graphics-core = "0.4"
+embedded-hal           = "1"
+embedded-hal-bus       = "0.3"
+gc9a01-rs              = "0.4.2"
+
+slint = { version = "1.17.1", default-features = false, features = [
+  "compat-1-2",
+  "unsafe-single-threaded",
+  "libm",
+  "renderer-software",
+] }
+
+# Wi-Fi + async networking (time sync, weather)
+embassy-executor = "0.10"
+embassy-net      = { version = "0.9", features = ["dhcpv4", "medium-ethernet", "tcp", "udp", "dns"] }
+embassy-time     = "0.5"
+esp-radio        = { version = "=1.0.0-beta.1", features = ["esp32s3", "wifi", "log-04"] } # beta.2 was yanked
+esp-rtos         = { version = "0.4.0", features = ["esp32s3", "esp-radio", "embassy", "log-04"] }
+static_cell      = "2.1"
+esp-storage = { version = "0.10", features = ["esp32s3"] }
+embedded-storage = "0.3"
+edge-dhcp = "0.8"
+edge-nal-embassy = "0.9"
+edge-nal = "0.7"
+embassy-futures = "0.1"
+embassy-sync = "0.8"
+embedded-io-async = "0.7"
+
+[build-dependencies]
+slint-build = "1.17.1"
 
 # For fine tuning these settings, please refer to https://doc.rust-lang.org/cargo/reference/profiles.html
 [profile.dev]
