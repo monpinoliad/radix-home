@@ -12,6 +12,13 @@ if [ -f wifi.env ]; then
     set +a
 fi
 
+# Optional Home Assistant calendar (git-ignored); see calendar.env.example.
+if [ -f calendar.env ]; then
+    set -a
+    source calendar.env
+    set +a
+fi
+
 case "$1" in
 "" | "release")
     cargo build --release

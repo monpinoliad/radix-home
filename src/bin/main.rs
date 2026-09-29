@@ -9,7 +9,7 @@
 
 extern crate alloc;
 
-use alloc::{boxed::Box, rc::Rc, vec::Vec};
+use alloc::{boxed::Box, format, rc::Rc, string::String, vec::Vec};
 use embassy_executor::Spawner;
 use embassy_net::{Stack, StackResources};
 use embassy_time::Timer;
@@ -41,8 +41,17 @@ use gc9a01::{
     prelude::{DisplayResolution240x240, DisplayRotation},
 };
 use radix_home::{
-    bins, credentials::Credentials, display::DrawBuffer, input::HoldButton, join::JoinProblem, net,
-    setup, storage, weather,
+    bins,
+    calendar::{self, Calendar, Line},
+    credentials::Credentials,
+    display::DrawBuffer,
+    input::HoldButton,
+    join::JoinProblem,
+    media::{self, NowPlaying},
+    net, setup,
+    slides::{self, Slide},
+    storage,
+    weather::{self, Weather},
 };
 use slint::{
     ModelRc, VecModel,
@@ -67,11 +76,8 @@ const ROTATE_180: bool = true;
 
 /// How often to sample the BOOT button.
 const INPUT_POLL_INTERVAL: Duration = Duration::from_millis(20);
-/// How often to push clock, weather and bins into the UI.
+/// How often to push clock, weather, bins and events into the UI.
 const UI_REFRESH_INTERVAL: Duration = Duration::from_millis(250);
-
-/// Used for the clock until the first forecast says otherwise (AEST, no daylight saving).
-const FALLBACK_UTC_OFFSET_S: i32 = 10 * 60 * 60;
 
 /// If the saved network hasn't given us an address this long after boot, open setup instead.
 const CONNECT_GIVE_UP: Duration = Duration::from_secs(60);
@@ -82,6 +88,10 @@ const SAVED_RESTART_DELAY: Duration = Duration::from_secs(2);
 
 /// Backlight brightness (percent). The screen never dims.
 const BRIGHTNESS: u8 = 100;
+
+/// Wi-Fi transmit power in 0.25 dBm steps (8..=84). esp-radio starts at 20 (5 dBm), which is weak;
+/// 60 is 15 dBm. Above about 65 some boards fail to authenticate.
+const WIFI_TX_POWER: i8 = 60;
 
 /// `BINS_DEMO=1 ./scripts/flash.sh`: show every bin all the time (even before the clock has
 /// synced), to see how they look.
@@ -249,11 +259,16 @@ async fn main(spawner: Spawner) -> ! {
         }
         None => setup::wifi_config(),
     };
-    let controller = WifiController::new(
+    let mut controller = WifiController::new(
         peripherals.WIFI,
         ControllerConfig::default().with_initial_config(wifi_config),
     )
     .unwrap();
+    // Both for joining the home network and for the setup hotspot. The radio is already started,
+    // and nothing restarts it, so this sticks.
+    if let Err(e) = controller.set_max_tx_power(WIFI_TX_POWER) {
+        log::warn!("couldn't set wifi tx power: {e:?}");
+    }
 
     let rng = Rng::new();
     let seed = (u64::from(rng.random()) << 32) | u64::from(rng.random());
@@ -272,6 +287,7 @@ async fn main(spawner: Spawner) -> ! {
             spawner.spawn(net::wifi_task(controller).unwrap());
             spawner.spawn(net::net_task(runner).unwrap());
             spawner.spawn(net::sync_task(stack).unwrap());
+            spawner.spawn(net::ha_task(stack).unwrap());
             log::info!("joining wifi {:?}", credentials.ssid);
             stack
         }
@@ -309,6 +325,7 @@ async fn main(spawner: Spawner) -> ! {
     let app = AppWindow::new().unwrap();
     app.set_setup_mode(setup_mode);
     app.set_bin_label(pixel_text("BIN NIGHT"));
+    app.set_agenda_title(pixel_text("COMING UP"));
     if BINS_DEMO {
         show_bins(&app, [true; bins::BINS.len()]);
     }
@@ -327,11 +344,17 @@ async fn main(spawner: Spawner) -> ! {
     let mut line_buffer = [Rgb565Pixel(0); SCREEN_SIZE as usize];
     let mut next_input_poll = Instant::now();
     let mut next_ui_refresh = Instant::now();
-    let mut shown_bins = [false; bins::BINS.len()];
+    let mut shown = Shown::default();
     let mut shown_status = "";
+    let mut slide_show = SlideShow::new();
 
     loop {
         slint::platform::update_timers_and_animations();
+
+        // Every pass, not just every UI refresh, so a slide moves smoothly.
+        if !setup_mode {
+            slide_show.animate(&app);
+        }
 
         if Instant::now() >= next_ui_refresh {
             next_ui_refresh = Instant::now() + UI_REFRESH_INTERVAL;
@@ -346,7 +369,8 @@ async fn main(spawner: Spawner) -> ! {
                     restart(false);
                 }
             } else {
-                refresh_clock_weather_and_bins(&app, &mut shown_bins);
+                refresh_ui(&app, &mut shown);
+                slide_show.advance(&app, |slide| shown.has_content(slide));
                 ever_connected |= stack.is_config_up();
                 let join_problem = net::snapshot().join_problem;
                 if !ever_connected && booted.elapsed() > CONNECT_GIVE_UP {
@@ -364,6 +388,9 @@ async fn main(spawner: Spawner) -> ! {
                 if status != shown_status {
                     shown_status = status;
                     app.set_status(pixel_text(status));
+                    // Black Wi-Fi screen until the first connection; its logo stops when it fails.
+                    app.set_connecting(!ever_connected);
+                    app.set_join_failing(!ever_connected && join_problem.is_some());
                 }
             }
 
@@ -410,49 +437,275 @@ fn show_setup_text(app: &AppWindow, lines: [&str; 4], footer: &str) {
     app.set_setup_footer(pixel_text(footer));
 }
 
-/// Pushes the latest time, sky and weather from the network tasks into the UI, and the bins
-/// when they change (`shown` is what's on screen).
-fn refresh_clock_weather_and_bins(app: &AppWindow, shown: &mut [bool; bins::BINS.len()]) {
+/// Which slide is up, and the one sliding in (see `slides`).
+struct SlideShow {
+    current: Slide,
+    since: Instant,
+    /// The slide coming in, and when it started.
+    arriving: Option<(Slide, Instant)>,
+}
+
+impl SlideShow {
+    fn new() -> Self {
+        Self {
+            current: Slide::Clock,
+            since: Instant::now(),
+            arriving: None,
+        }
+    }
+
+    /// Starts sliding to the next slide once this one has been up long enough, or right away if
+    /// it has nothing left to show (e.g. the music stopped).
+    fn advance(&mut self, app: &AppWindow, has_content: impl Fn(Slide) -> bool) {
+        if self.arriving.is_some() {
+            return;
+        }
+        let up_ms = self.since.elapsed().as_millis();
+        if up_ms < self.current.stays_ms() && has_content(self.current) {
+            return;
+        }
+        let next = slides::next(self.current, has_content);
+        if next == self.current {
+            self.since = Instant::now();
+            return;
+        }
+        self.arriving = Some((next, Instant::now()));
+        app.set_slide_from(self.current as i32);
+        app.set_slide_to(next as i32);
+        app.set_slide_shift(0);
+    }
+
+    /// Moves the arriving slide in; when it's in, it's the current one.
+    fn animate(&mut self, app: &AppWindow) {
+        let Some((next, started)) = self.arriving else {
+            return;
+        };
+        let elapsed_ms = started.elapsed().as_millis();
+        if elapsed_ms < slides::SLIDE_MS {
+            app.set_slide_shift(slides::shift(elapsed_ms));
+            return;
+        }
+        self.current = next;
+        self.since = Instant::now();
+        self.arriving = None;
+        app.set_slide_from(next as i32);
+        app.set_slide_to(next as i32);
+        app.set_slide_shift(0);
+    }
+}
+
+/// The forecast slide as shown, to tell when it changes.
+#[derive(PartialEq)]
+struct ForecastView {
+    icon: i32,
+    range: String,
+    rain: String,
+    /// Label, icon, temperature.
+    hours: Vec<(String, i32, String)>,
+}
+
+/// Hours on the forecast slide, and how many hours apart.
+const FORECAST_COLUMNS: usize = 4;
+const FORECAST_STEP_HOURS: usize = 3;
+
+impl ForecastView {
+    fn new(forecast: &Weather, now: i64) -> Self {
+        let degrees = |c: f32| format!("{}°", weather::round_c(c));
+        Self {
+            icon: weather::icon_for(forecast.code, false),
+            range: format!("{}/{}", degrees(forecast.high_c), degrees(forecast.low_c)),
+            rain: forecast
+                .rain_chance
+                .map_or_else(String::new, |chance| format!("RAIN {chance}%")),
+            hours: forecast
+                .hours_after(now)
+                .step_by(FORECAST_STEP_HOURS)
+                .take(FORECAST_COLUMNS)
+                .map(|hour| {
+                    let (h, _, _) = weather::local_hms(hour.time, forecast.utc_offset_s);
+                    let label =
+                        format!("{}{}", (h + 11) % 12 + 1, if h < 12 { "AM" } else { "PM" });
+                    (label, forecast.hour_icon(hour), degrees(hour.temperature_c))
+                })
+                .collect(),
+        }
+    }
+
+    fn show(&self, app: &AppWindow) {
+        app.set_forecast_icon(self.icon);
+        app.set_forecast_range(pixel_text(&self.range));
+        app.set_forecast_rain(pixel_text(&self.rain));
+        let columns: Vec<HourColumn> = self
+            .hours
+            .iter()
+            .map(|(label, icon, temp)| HourColumn {
+                label: pixel_text(label),
+                icon: *icon,
+                temp: pixel_text(temp),
+            })
+            .collect();
+        app.set_forecast_hours(ModelRc::new(VecModel::from(columns)));
+    }
+}
+
+/// What's on screen, so the UI is only touched when something changes.
+#[derive(Default)]
+struct Shown {
+    bins: [bool; bins::BINS.len()],
+    calendar_version: u32,
+    calendar: Option<Calendar>,
+    events: Vec<Line>,
+    agenda: Vec<Line>,
+    small_time: String,
+    date: String,
+    forecast: Option<ForecastView>,
+    media_version: u32,
+    playing: Option<NowPlaying>,
+    music_elapsed: String,
+}
+
+impl Shown {
+    fn has_content(&self, slide: Slide) -> bool {
+        match slide {
+            Slide::Clock => true,
+            Slide::Agenda => !self.agenda.is_empty(),
+            Slide::Forecast => self.forecast.is_some(),
+            Slide::Music => self.playing.is_some(),
+        }
+    }
+}
+
+fn event_lines(lines: &[Line]) -> ModelRc<EventLine> {
+    let lines: Vec<EventLine> = lines
+        .iter()
+        .map(|line| EventLine {
+            glyphs: pixel_text(&line.text),
+            important: line.important,
+        })
+        .collect();
+    ModelRc::new(VecModel::from(lines))
+}
+
+/// Pushes the latest time, sky and weather from the network tasks into the UI, and the bins,
+/// events, forecast and music when they change.
+fn refresh_ui(app: &AppWindow, shown: &mut Shown) {
     let snapshot = net::snapshot();
     let Some(now) = snapshot.unix_now() else {
         app.set_time_valid(false);
         return;
     };
 
-    let utc_offset = snapshot
-        .weather
-        .map_or(FALLBACK_UTC_OFFSET_S, |w| w.utc_offset_s);
+    let utc_offset = snapshot.utc_offset_s();
     let (hours, minutes, seconds) = weather::local_hms(now, utc_offset);
     app.set_time_valid(true);
     app.set_hours(hours);
     app.set_minutes(minutes);
     app.set_colon_on(seconds % 2 == 0);
 
-    let due = bins::due(now, utc_offset);
-    if !BINS_DEMO && due != *shown {
-        *shown = due;
+    let small_time = calendar::clock_12h(now, utc_offset);
+    if small_time != shown.small_time {
+        app.set_small_time(pixel_text(&small_time));
+        shown.small_time = small_time;
+    }
+    let date = calendar::date_text(calendar::local_day(now, utc_offset));
+    if date != shown.date {
+        app.set_date_text(pixel_text(&date));
+        shown.date = date;
+    }
+
+    if snapshot.calendar_version != shown.calendar_version {
+        shown.calendar_version = snapshot.calendar_version;
+        shown.calendar = net::calendar();
+    }
+
+    // From the bin calendar in Home Assistant when there is one, else the built-in schedule.
+    let due = shown
+        .calendar
+        .as_ref()
+        .and_then(|calendar| calendar.bins_due(now, utc_offset))
+        .unwrap_or_else(|| bins::due(now, utc_offset));
+    if !BINS_DEMO && due != shown.bins {
+        shown.bins = due;
         show_bins(app, due);
     }
 
-    match snapshot.weather {
-        Some(forecast) => {
-            app.set_sky_phase(forecast.sky(now) as i32);
-            app.set_moon_visible(forecast.is_night(now));
-            app.set_weather_valid(true);
-            app.set_weather_icon(forecast.icon(now));
-            app.set_temperature(forecast.temperature_rounded());
+    let events = shown
+        .calendar
+        .as_ref()
+        .map_or_else(Vec::new, |calendar| calendar.lines(now, utc_offset));
+    if events != shown.events {
+        app.set_events(event_lines(&events));
+        shown.events = events;
+    }
+    let agenda = shown
+        .calendar
+        .as_ref()
+        .map_or_else(Vec::new, |calendar| calendar.agenda(now, utc_offset));
+    if agenda != shown.agenda {
+        app.set_agenda(event_lines(&agenda));
+        shown.agenda = agenda;
+    }
+
+    refresh_music(app, shown, &snapshot, now);
+    refresh_weather(app, shown, snapshot.weather.as_ref(), now, hours);
+}
+
+/// Sky, weather row and forecast slide. Borrows the forecast: with its hours it's big to copy.
+fn refresh_weather(
+    app: &AppWindow,
+    shown: &mut Shown,
+    forecast: Option<&Weather>,
+    now: i64,
+    hours: i32,
+) {
+    let Some(forecast) = forecast else {
+        // No forecast yet: guess day/night from the clock.
+        let night = !(6..19).contains(&hours);
+        let sky = if night {
+            weather::Sky::Night
+        } else {
+            weather::Sky::Day
+        };
+        app.set_sky_phase(sky as i32);
+        app.set_moon_visible(night);
+        return;
+    };
+    app.set_sky_phase(forecast.sky(now) as i32);
+    app.set_moon_visible(forecast.is_night(now));
+    app.set_weather_valid(true);
+    app.set_weather_icon(forecast.icon(now));
+    app.set_temperature(forecast.temperature_rounded());
+    let view = ForecastView::new(forecast, now);
+    if shown.forecast.as_ref() != Some(&view) {
+        view.show(app);
+        shown.forecast = Some(view);
+    }
+}
+
+/// The music slide: title and artist when the song changes, progress every second.
+fn refresh_music(app: &AppWindow, shown: &mut Shown, snapshot: &net::Snapshot, now: i64) {
+    if snapshot.media_version != shown.media_version {
+        shown.media_version = snapshot.media_version;
+        shown.playing = net::now_playing();
+        if let Some(playing) = &shown.playing {
+            app.set_music_title(pixel_text(&calendar::display_text(&playing.title)));
+            app.set_music_artist(pixel_text(&calendar::display_text(&playing.artist)));
+            let length = playing
+                .duration_s
+                .map_or_else(String::new, media::duration_text);
+            app.set_music_length(pixel_text(&length));
         }
-        None => {
-            // No forecast yet: guess day/night from the clock.
-            let night = !(6..19).contains(&hours);
-            let sky = if night {
-                weather::Sky::Night
-            } else {
-                weather::Sky::Day
-            };
-            app.set_sky_phase(sky as i32);
-            app.set_moon_visible(night);
-        }
+    }
+    let Some(playing) = &shown.playing else {
+        return;
+    };
+    let elapsed = playing
+        .elapsed_s(now)
+        .map_or_else(String::new, media::duration_text);
+    if elapsed != shown.music_elapsed {
+        app.set_music_elapsed(pixel_text(&elapsed));
+        app.set_music_progress(playing.progress(now).unwrap_or(-1.0));
+        shown.music_elapsed = elapsed;
     }
 }
 

@@ -3,6 +3,9 @@
 
 - ui/font/{big,small}/*.png   clock (4x) and temperature (3x) glyphs, 5x7 font
 - ui/font/text/*.png + ui/font/text.slint   uppercase text font (2x) for the Wi-Fi setup screen
+- ui/font/important.png       red "!" badge before important events (7x7 art, 2x, text height)
+- ui/music/note.png           music note on the now-playing slide (12x12 art, 3x)
+- ui/wifi/{0,1,2,3,off}.png   Wi-Fi logo while connecting: dot + 0-3 arcs lit, or all dim (17x12 art, 4x)
 - ui/web/pixel.ttf            the same font as a TrueType web font, for the setup web page
 - ui/weather/*.png            weather icons (12x12 art, 3x)
 - ui/sky/moon.png             the moon that circles the screen at night (10x10 art, 2x)
@@ -101,10 +104,13 @@ SYMBOLS = {
     "bang": ["..#..", "..#..", "..#..", "..#..", "..#..", ".....", "..#.."],
     "question": [".###.", "#...#", "....#", "...#.", "..#..", ".....", "..#.."],
     "slash": ["....#", "....#", "...#.", "..#..", ".#...", "#....", "#...."],
+    "percent": ["##..#", "##..#", "...#.", "..#..", ".#...", "#..##", "#..##"],
+    "degree": [".##..", "#..#.", "#..#.", ".##..", ".....", ".....", "....."],
 }
 # Glyph order for ui/font/text.slint. Must match TEXT_CHARS in src/setup/mod.rs.
-TEXT_CHARS = " ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-.:!?/"
-TEXT_NAMES = {" ": "space", "-": "dash", ".": "dot", ":": "colon", "!": "bang", "?": "question", "/": "slash"}
+TEXT_CHARS = " ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-.:!?/%°"
+TEXT_NAMES = {" ": "space", "-": "dash", ".": "dot", ":": "colon", "!": "bang", "?": "question", "/": "slash",
+              "%": "percent", "°": "degree"}
 
 
 # Extra punctuation for the web font only (the device screen doesn't need it).
@@ -477,6 +483,94 @@ BIN_COLOURS = [
 ]
 
 
+# Red badge with a white "!", in front of important events (titles starting with "!").
+IMPORTANT = [".RRRRR.", "RRRWRRR", "RRRWRRR", "RRRWRRR", "RRRRRRR", "RRRWRRR", ".RRRRR."]
+IMPORTANT_COLOURS = {"R": (226, 60, 56, 255), "W": GLYPH_INK}
+
+
+def draw_important():
+    """Same 1px drop shadow as the text glyphs, so it lines up with them."""
+    w, h = len(IMPORTANT[0]) + 1, len(IMPORTANT) + 1
+    px = [[CLEAR] * w for _ in range(h)]
+    for y, row in enumerate(IMPORTANT):
+        for x, c in enumerate(row):
+            if c != ".":
+                px[y + 1][x + 1] = GLYPH_SHADOW
+    for y, row in enumerate(IMPORTANT):
+        for x, c in enumerate(row):
+            if c != ".":
+                px[y][x] = IMPORTANT_COLOURS[c]
+    return px
+
+
+# Beamed pair of notes, Spotify green, on the now-playing slide.
+NOTE = [
+    "....########",
+    "....########",
+    "....#......#",
+    "....#......#",
+    "....#......#",
+    "....#......#",
+    "....#......#",
+    "..###....###",
+    ".####...####",
+    ".####...####",
+    "..##.....##.",
+    "............",
+]
+NOTE_COLOUR = (30, 215, 96, 255)
+
+
+def draw_note():
+    """With the text glyphs' drop shadow, so it reads on any sky."""
+    w, h = len(NOTE[0]) + 1, len(NOTE) + 1
+    px = [[CLEAR] * w for _ in range(h)]
+    for y, row in enumerate(NOTE):
+        for x, c in enumerate(row):
+            if c == "#":
+                px[y + 1][x + 1] = GLYPH_SHADOW
+    for y, row in enumerate(NOTE):
+        for x, c in enumerate(row):
+            if c == "#":
+                px[y][x] = NOTE_COLOUR
+    return px
+
+
+# Wi-Fi logo: a dot and three arcs, fanning 45 degrees either side of straight up.
+WIFI_W, WIFI_H = 17, 12
+WIFI_LIT = GLYPH_INK
+WIFI_DIM = (70, 78, 104, 255)
+# (inner, outer) radius of the dot and each arc, from the dot's centre.
+WIFI_RINGS = [(0.0, 1.6), (3.4, 5.0), (6.4, 8.0), (9.4, 11.0)]
+
+
+def wifi_ring(x, y):
+    """Which of WIFI_RINGS the pixel is in, or None."""
+    cx, cy = WIFI_W / 2, WIFI_H - 1.5
+    dx, dy = x + 0.5 - cx, y + 0.5 - cy
+    r = math.hypot(dx, dy)
+    for i, (inner, outer) in enumerate(WIFI_RINGS):
+        if inner <= r < outer and (i == 0 or (dy < 0 and abs(dx) <= -dy)):
+            return i
+    return None
+
+
+def draw_wifi(lit):
+    """The dot and the first `lit - 1` arcs lit, the rest dim; `lit` 0 is all dim."""
+    px = [[CLEAR] * (WIFI_W + 1) for _ in range(WIFI_H + 1)]
+    rings = [[wifi_ring(x, y) for x in range(WIFI_W)] for y in range(WIFI_H)]
+    for y in range(WIFI_H):
+        for x in range(WIFI_W):
+            if rings[y][x] is not None:
+                px[y + 1][x + 1] = GLYPH_SHADOW
+    for y in range(WIFI_H):
+        for x in range(WIFI_W):
+            ring = rings[y][x]
+            if ring is not None:
+                px[y][x] = WIFI_LIT if ring < lit else WIFI_DIM
+    return px
+
+
 def draw_bin(colours):
     palette = dict(BIN_FIXED)
     palette.update(zip("LlHBb", colours))
@@ -503,6 +597,17 @@ if __name__ == "__main__":
             f.write(f'        @image-url("text/{name}.png"),\n')
         f.write("    ];\n}\n")
     print("wrote ui/font/text/*.png, ui/font/text.slint")
+
+    write_png(os.path.join(UI_DIR, "font", "important.png"), draw_important(), 2)
+    print("wrote ui/font/important.png")
+
+    write_png(os.path.join(UI_DIR, "music", "note.png"), draw_note(), 3)
+    print("wrote ui/music/note.png")
+
+    for frame in range(4):
+        write_png(os.path.join(UI_DIR, "wifi", f"{frame}.png"), draw_wifi(frame + 1), 4)
+    write_png(os.path.join(UI_DIR, "wifi", "off.png"), draw_wifi(0), 4)
+    print("wrote ui/wifi/*.png")
 
     os.makedirs(os.path.join(UI_DIR, "web"), exist_ok=True)
     with open(os.path.join(UI_DIR, "web", "pixel.ttf"), "wb") as f:

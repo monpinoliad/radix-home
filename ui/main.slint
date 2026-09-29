@@ -1,9 +1,26 @@
 // Pixel clock + weather over a sky that follows the real time of day.
-// On bin night the bins to put out stand on the grass (src/bins.rs decides which).
+// Slides (src/slides.rs picks which): the clock with the date, weather and today's events from
+// Home Assistant (src/calendar.rs picks them); the coming days; the forecast; what's playing.
+// The sky, moon and ground stay put while slides move across them.
+// Until the first Wi-Fi connection: a black screen with an animated Wi-Fi logo and what's happening.
+// On bin night the bins to put out stand on the grass (src/calendar.rs / src/bins.rs decide which).
 // All art comes from tools/gen_sprites.py, pre-scaled so Slint blits it 1:1.
 // Holding BOOT opens Wi-Fi setup, which shows how to join the setup hotspot.
 
 import { PixelFont } from "font/text.slint";
+
+// An event, e.g. "7:00PM DINNER", in `PixelFont` glyphs.
+export struct EventLine {
+    glyphs: [int],
+    important: bool, // title started with "!": red badge in front, shown for longer
+}
+
+// One column of the forecast slide's hours.
+export struct HourColumn {
+    label: [int], // "8PM"
+    icon: int,    // index into `weather-icons`
+    temp: [int],  // "13°"
+}
 
 // A line of the uppercase pixel font; `glyphs` are indices from `setup::glyphs` in Rust.
 component PixelText {
@@ -16,6 +33,106 @@ component PixelText {
         source: PixelFont.glyphs[glyph];
         x: i * root.advance;
         y: 0px;
+    }
+}
+
+// Pixel text at most `limit` wide (including the badge of an `important` line, which stays put).
+// Each showing pauses, scrolls a longer line across to its end, pauses again, then says `shown`.
+component Marquee {
+    in property <[int]> glyphs;
+    in property <bool> important;
+    in property <length> limit;
+    callback shown();
+
+    property <duration> step-time: 50ms;                  // 2px per step: 40px/s
+    property <int> pause-steps: important ? 100 : 50;     // 5s / 2.5s at each end
+    property <length> badge-width: important ? 20px : 0px; // 16px badge + 4px gap
+    property <length> text-limit: limit - badge-width;
+    property <length> text-width: glyphs.length * 12px;
+    property <int> travel-steps: Math.max(0, Math.ceil((root.text-width - root.text-limit) / 2px));
+    property <int> step: 0;
+
+    width: root.badge-width + Math.min(root.text-width, root.text-limit);
+    height: 16px;
+
+    changed glyphs => {
+        self.step = 0;
+    }
+
+    if root.important: Image {
+        source: @image-url("font/important.png");
+        x: 0px;
+        y: 0px;
+    }
+
+    Timer {
+        interval: root.step-time;
+        running: root.glyphs.length > 0;
+        triggered => {
+            root.step += 1;
+            if root.step >= root.travel-steps + 2 * root.pause-steps {
+                root.step = 0;
+                root.shown();
+            }
+        }
+    }
+
+    Rectangle {
+        x: root.badge-width;
+        width: Math.min(root.text-width, root.text-limit);
+        clip: true;
+
+        PixelText {
+            glyphs: root.glyphs;
+            x: -Math.min(Math.max(root.step - root.pause-steps, 0), root.travel-steps) * 2px;
+            y: 0px;
+        }
+    }
+}
+
+// Loading: 8 dots round a circle, the bright one going round with a fading tail.
+component Spinner {
+    width: 24px;
+    height: 24px;
+
+    property <int> step: 0;
+    property <[{x: length, y: length}]> dots: [
+        { x: 10px, y: 0px }, { x: 17px, y: 3px }, { x: 20px, y: 10px }, { x: 17px, y: 17px },
+        { x: 10px, y: 20px }, { x: 3px, y: 17px }, { x: 0px, y: 10px }, { x: 3px, y: 3px },
+    ];
+    // By how many steps behind the bright dot a dot is; with a drop shadow like the text's.
+    property <[color]> tail: [#ffffff, #ffffffd8, #ffffffa8, #ffffff78, #ffffff58, #ffffff58, #ffffff58, #ffffff58];
+    property <[color]> shadow: [#141830aa, #14183090, #14183070, #14183050, #14183038, #14183038, #14183038, #14183038];
+
+    Timer {
+        interval: 100ms;
+        running: true;
+        triggered => {
+            root.step = Math.mod(root.step + 1, 8);
+        }
+    }
+
+    for dot[i] in root.dots: Rectangle {
+        x: dot.x;
+        y: dot.y;
+        width: 6px;
+        height: 6px;
+
+        Rectangle {
+            x: 2px;
+            y: 2px;
+            width: 4px;
+            height: 4px;
+            background: root.shadow[Math.mod(root.step - i + 8, 8)];
+        }
+
+        Rectangle {
+            x: 0px;
+            y: 0px;
+            width: 4px;
+            height: 4px;
+            background: root.tail[Math.mod(root.step - i + 8, 8)];
+        }
     }
 }
 
@@ -37,6 +154,31 @@ export component AppWindow inherits Window {
     in property <[int]> bins;               // due tonight: indices into `bin-images`
     in property <[int]> bin-label;          // "BIN NIGHT" in `PixelFont` glyphs
     in property <[int]> status;             // e.g. "JOINING WI-FI"; empty once online
+    in property <bool> connecting: true;    // before the first connection: the Wi-Fi screen
+    in property <bool> join-failing: false; // it said why (wrong password...): logo stops, dims
+    in property <[EventLine]> events;       // today's, shown one at a time
+    in property <[int]> date-text;          // "MON 28 SEP"
+    in property <[int]> small-time;         // "7:30PM", at the top of the other slides
+
+    // Slides (see src/slides.rs): 0 clock, 1 agenda, 2 forecast, 3 music. While one slides in,
+    // `slide-from` moves out left by `slide-shift` px and `slide-to` follows it in.
+    in property <int> slide-from: 0;
+    in property <int> slide-to: 0;
+    in property <int> slide-shift: 0;
+
+    in property <[int]> agenda-title;       // "COMING UP"
+    in property <[EventLine]> agenda;
+
+    in property <int> forecast-icon;        // today's, index into `weather-icons`
+    in property <[int]> forecast-range;     // "17°/12°"
+    in property <[int]> forecast-rain;      // "RAIN 76%", or empty
+    in property <[HourColumn]> forecast-hours;
+
+    in property <[int]> music-title;
+    in property <[int]> music-artist;
+    in property <float> music-progress: -1; // 0 to 1; below 0 when unknown
+    in property <[int]> music-elapsed;      // "1:23"
+    in property <[int]> music-length;       // "3:42"
 
     // Wi-Fi setup screen: replaces the clock and weather.
     in property <bool> setup-mode: false;
@@ -106,17 +248,31 @@ export component AppWindow inherits Window {
         @image-url("weather/storm.png"),
     ];
 
-    // Clock: 4x font, digits 24px wide, colon 8px, 4px gaps -> 120px, centred.
-    property <length> clock-y: 44px;
-    property <[length]> clock-digit-x: [60px, 88px, 128px, 156px];
-    property <length> clock-colon-x: 116px;
+    // Clock: 12-hour, e.g. "7:30 PM". 4x font: digits 24px wide, colon 8px, 4px gaps; then AM/PM in
+    // the text font 6px after, bottom-aligned. Centred as a whole. "--:--" (120px) until synced.
+    // On a day with nothing else to show, the date, time and weather sit centred in the sky
+    // (24px keeps the 4x digits on their pixel grid).
+    property <length> clock-shift: root.time-valid && root.weather-valid && root.events.length == 0 && root.bins.length == 0 ? 24px : 0px;
+    property <length> clock-y: 44px + root.clock-shift;
+    property <int> hours-12: Math.mod(hours + 11, 12) + 1;
+    property <bool> clock-two-digit-hour: !time-valid || hours-12 >= 10;
+    property <length> clock-hour-width: clock-two-digit-hour ? 52px : 24px;
+    property <length> clock-am-pm-width: time-valid ? 6px + 24px : 0px;
+    property <length> clock-width: clock-hour-width + 16px + 52px + clock-am-pm-width;
+    property <length> clock-x: Math.round((root.width - clock-width) / 2 / 4px) * 4px;
+    property <length> clock-colon-x: clock-x + clock-hour-width + 4px;
+    property <[length]> clock-digit-x: [
+        clock-x, clock-x + (clock-two-digit-hour ? 28px : 0px),
+        clock-colon-x + 12px, clock-colon-x + 40px,
+    ];
+    property <length> clock-am-pm-x: clock-colon-x + 12px + 52px + 6px;
     property <[int]> clock-digits: [
-        Math.floor(hours / 10), Math.mod(hours, 10),
+        Math.floor(hours-12 / 10), Math.mod(hours-12, 10),
         Math.floor(minutes / 10), Math.mod(minutes, 10),
     ];
 
     // Weather row: 36px icon, 6px gap, then e.g. "-12°" in the 3x font (3px gaps), centred.
-    property <length> weather-y: 84px;
+    property <length> weather-y: 84px + root.clock-shift;
     property <length> glyph-gap: 3px;
     property <length> small-digit-width: 18px;
     property <length> small-symbol-width: 12px; // minus, degree
@@ -142,6 +298,42 @@ export component AppWindow inherits Window {
     property <length> bins-x: (root.width - root.bins.length * (bin-width + bin-gap) + bin-gap) / 2;
 
     property <length> ground-y: 196px;
+
+    // ---- Text row (loading spinner, then events): just above the bin lids on bin night, else
+    // halfway between the weather row and the grass ----
+    property <length> text-row-y: root.bins.length > 0 ? 122px : 148px;
+    property <length> event-max-width: 192px; // 16 characters; longer ones scroll
+    property <int> event-index: 0;
+
+    // ---- Connecting screen ----
+    property <[image]> wifi-frames: [
+        @image-url("wifi/0.png"), @image-url("wifi/1.png"),
+        @image-url("wifi/2.png"), @image-url("wifi/3.png"),
+    ];
+    property <int> wifi-frame: 0;
+
+    // ---- Other slides ----
+    property <length> header-y: 22px;       // date on the clock slide, small time on the rest
+    property <length> hour-column-width: 52px;
+    property <length> music-bar-width: 160px;
+
+    pure function slide-x(slide: int) -> length {
+        if slide == root.slide-to && root.slide-from != root.slide-to {
+            return root.width - root.slide-shift * 1px;
+        }
+        if slide == root.slide-to {
+            return 0px;
+        }
+        return -root.slide-shift * 1px;
+    }
+
+    pure function slide-shown(slide: int) -> bool {
+        return !root.setup-mode && (slide == root.slide-from || slide == root.slide-to);
+    }
+
+    pure function centred(width: length) -> length {
+        return Math.round((root.width - width) / 2 / 2px) * 2px;
+    }
 
     // Moon orbit.
     Timer {
@@ -195,87 +387,315 @@ export component AppWindow inherits Window {
         background: root.ground-colors[root.sky-phase];
     }
 
-    // ---- Weather ----
-    if root.weather-valid && !root.setup-mode: Rectangle {
-        Image {
-            source: root.weather-icons[root.weather-icon];
-            x: root.weather-row-x;
-            y: root.weather-y;
+    // ---- Clock slide ----
+    Rectangle {
+        x: root.slide-x(0);
+        width: root.width;
+        height: root.height;
+        visible: root.slide-shown(0);
+
+        if root.time-valid: PixelText {
+            glyphs: root.date-text;
+            x: root.centred(self.width);
+            y: root.header-y + root.clock-shift;
         }
 
-        if root.temp-negative: Image {
-            source: @image-url("font/small/minus.png");
-            x: root.weather-row-x + 42px;
-            y: root.weather-y + 6px;
-        }
+        // ---- Weather ----
+        if root.weather-valid && !root.setup-mode: Rectangle {
+            Image {
+                source: root.weather-icons[root.weather-icon];
+                x: root.weather-row-x;
+                y: root.weather-y;
+            }
 
-        if root.temp-two-digits: Image {
-            source: root.small-digits[Math.floor(root.temp-abs / 10)];
-            x: root.temp-x;
-            y: root.weather-y + 6px;
-        }
+            if root.temp-negative: Image {
+                source: @image-url("font/small/minus.png");
+                x: root.weather-row-x + 42px;
+                y: root.weather-y + 6px;
+            }
 
-        Image {
-            source: root.small-digits[Math.mod(root.temp-abs, 10)];
-            x: root.temp-x + (root.temp-two-digits ? root.small-digit-width + root.glyph-gap : 0px);
-            y: root.weather-y + 6px;
-        }
-
-        Image {
-            source: @image-url("font/small/degree.png");
-            x: root.temp-x + root.temp-digits-width + root.glyph-gap;
-            y: root.weather-y + 6px;
-        }
-    }
-
-    // ---- Bins (wheels just on the grass, label below) ----
-    if !root.setup-mode: Rectangle {
-        for bin[i] in root.bins: Rectangle {
-            x: root.bins-x + i * (root.bin-width + root.bin-gap);
-            y: root.ground-y - root.bin-height + 4px;
-            width: root.bin-width;
-            height: root.bin-height;
-
-            Rectangle {
-                x: 4px;
-                y: parent.height - 8px;
-                width: parent.width - 8px;
-                height: 4px;
-                background: root.ground-shade-colors[root.sky-phase];
+            if root.temp-two-digits: Image {
+                source: root.small-digits[Math.floor(root.temp-abs / 10)];
+                x: root.temp-x;
+                y: root.weather-y + 6px;
             }
 
             Image {
-                source: root.bin-images[bin];
+                source: root.small-digits[Math.mod(root.temp-abs, 10)];
+                x: root.temp-x + (root.temp-two-digits ? root.small-digit-width + root.glyph-gap : 0px);
+                y: root.weather-y + 6px;
+            }
+
+            Image {
+                source: @image-url("font/small/degree.png");
+                x: root.temp-x + root.temp-digits-width + root.glyph-gap;
+                y: root.weather-y + 6px;
             }
         }
 
-        if root.bins.length > 0: PixelText {
-            glyphs: root.bin-label;
+        // ---- Bins (wheels just on the grass, label below) ----
+        if !root.setup-mode: Rectangle {
+            for bin[i] in root.bins: Rectangle {
+                x: root.bins-x + i * (root.bin-width + root.bin-gap);
+                y: root.ground-y - root.bin-height + 4px;
+                width: root.bin-width;
+                height: root.bin-height;
+
+                Rectangle {
+                    x: 4px;
+                    y: parent.height - 8px;
+                    width: parent.width - 8px;
+                    height: 4px;
+                    background: root.ground-shade-colors[root.sky-phase];
+                }
+
+                Image {
+                    source: root.bin-images[bin];
+                }
+            }
+
+            if root.bins.length > 0: PixelText {
+                glyphs: root.bin-label;
+                x: Math.round((root.width - self.width) / 2 / 2px) * 2px;
+                y: 206px;
+            }
+        }
+
+        // ---- Clock (--:-- until the time is synced) ----
+        for i in 4: Image {
+            source: root.time-valid ? root.big-digits[root.clock-digits[i]] : @image-url("font/big/minus.png");
+            x: root.clock-digit-x[i] + (root.time-valid ? 0px : 4px);
+            y: root.clock-y;
+            visible: !root.setup-mode && (i != 0 || root.clock-two-digit-hour);
+        }
+
+        Image {
+            source: @image-url("font/big/colon.png");
+            x: root.clock-colon-x;
+            y: root.clock-y;
+            visible: !root.setup-mode && (!root.time-valid || root.colon-on);
+        }
+
+        // AM/PM: `PixelFont` glyphs 1 (A), 16 (P), 13 (M).
+        if root.time-valid && !root.setup-mode: Rectangle {
+            Image {
+                source: PixelFont.glyphs[root.hours >= 12 ? 16 : 1];
+                x: root.clock-am-pm-x;
+                y: root.clock-y + 14px;
+            }
+
+            Image {
+                source: PixelFont.glyphs[13];
+                x: root.clock-am-pm-x + 12px;
+                y: root.clock-y + 14px;
+            }
+        }
+
+        // ---- Loading: online, but no time or weather yet ----
+        if !root.connecting && (!root.time-valid || !root.weather-valid): Spinner {
+            x: root.centred(self.width);
+            y: root.text-row-y - 4px;
+        }
+
+        // ---- Today's events, in the same place once online ----
+        if !root.setup-mode && root.time-valid && root.weather-valid && root.events.length > 0: Marquee {
+            glyphs: root.events[Math.mod(root.event-index, root.events.length)].glyphs;
+            important: root.events[Math.mod(root.event-index, root.events.length)].important;
+            limit: root.event-max-width;
             x: Math.round((root.width - self.width) / 2 / 2px) * 2px;
-            y: 206px;
+            y: root.text-row-y;
+            shown => {
+                root.event-index = Math.mod(root.event-index + 1, root.events.length);
+            }
         }
     }
 
-    // ---- Clock (--:-- until the time is synced) ----
-    for i in 4: Image {
-        source: root.time-valid ? root.big-digits[root.clock-digits[i]] : @image-url("font/big/minus.png");
-        x: root.clock-digit-x[i] + (root.time-valid ? 0px : 4px);
-        y: root.clock-y;
-        visible: !root.setup-mode;
+    // ---- Agenda slide: the coming days ----
+    Rectangle {
+        x: root.slide-x(1);
+        width: root.width;
+        height: root.height;
+        visible: root.slide-shown(1);
+
+        PixelText {
+            glyphs: root.small-time;
+            x: root.centred(self.width);
+            y: root.header-y;
+        }
+
+        PixelText {
+            glyphs: root.agenda-title;
+            x: root.centred(self.width);
+            y: 48px;
+        }
+
+        for line[i] in root.agenda: Marquee {
+            glyphs: line.glyphs;
+            important: line.important;
+            limit: 200px;
+            x: root.centred(self.width);
+            y: 76px + i * 22px;
+        }
     }
 
-    Image {
-        source: @image-url("font/big/colon.png");
-        x: root.clock-colon-x;
-        y: root.clock-y;
-        visible: !root.setup-mode && (!root.time-valid || root.colon-on);
+    // ---- Forecast slide: today, then the next hours ----
+    Rectangle {
+        x: root.slide-x(2);
+        width: root.width;
+        height: root.height;
+        visible: root.slide-shown(2);
+
+        PixelText {
+            glyphs: root.small-time;
+            x: root.centred(self.width);
+            y: root.header-y;
+        }
+
+        // Today: icon, then high/low.
+        Rectangle {
+            property <length> row-width: 36px + 6px + root.forecast-range.length * 12px;
+            x: root.centred(self.row-width);
+            y: 44px;
+            width: self.row-width;
+            height: 36px;
+
+            Image {
+                source: root.weather-icons[root.forecast-icon];
+                x: 0px;
+                y: 0px;
+            }
+
+            PixelText {
+                glyphs: root.forecast-range;
+                x: 42px;
+                y: 10px;
+            }
+        }
+
+        PixelText {
+            glyphs: root.forecast-rain;
+            x: root.centred(self.width);
+            y: 86px;
+        }
+
+        for hour[i] in root.forecast-hours: Rectangle {
+            x: root.centred(root.forecast-hours.length * root.hour-column-width) + i * root.hour-column-width;
+            y: 110px;
+            width: root.hour-column-width;
+            height: 74px;
+
+            PixelText {
+                glyphs: hour.label;
+                x: Math.round((parent.width - self.width) / 2 / 2px) * 2px;
+                y: 0px;
+            }
+
+            Image {
+                source: root.weather-icons[hour.icon];
+                x: (parent.width - 36px) / 2;
+                y: 18px;
+            }
+
+            PixelText {
+                glyphs: hour.temp;
+                x: Math.round((parent.width - self.width) / 2 / 2px) * 2px;
+                y: 58px;
+            }
+        }
     }
 
-    // ---- Wi-Fi status (until the first connection) ----
-    if !root.setup-mode && root.status.length > 0: PixelText {
-        glyphs: root.status;
-        x: Math.round((root.width - self.width) / 2 / 2px) * 2px;
-        y: 122px; // between the weather row and the bin lids
+    // ---- Music slide: what's playing ----
+    Rectangle {
+        x: root.slide-x(3);
+        width: root.width;
+        height: root.height;
+        visible: root.slide-shown(3);
+
+        PixelText {
+            glyphs: root.small-time;
+            x: root.centred(self.width);
+            y: root.header-y;
+        }
+
+        Image {
+            source: @image-url("music/note.png");
+            x: root.centred(39px);
+            y: 44px;
+        }
+
+        Marquee {
+            glyphs: root.music-title;
+            limit: 200px;
+            x: root.centred(self.width);
+            y: 94px;
+        }
+
+        Marquee {
+            glyphs: root.music-artist;
+            limit: 184px;
+            x: root.centred(self.width);
+            y: 116px;
+        }
+
+        if root.music-progress >= 0: Rectangle {
+            x: root.centred(root.music-bar-width);
+            y: 146px;
+            width: root.music-bar-width;
+            height: 34px;
+
+            Rectangle {
+                y: 0px;
+                width: parent.width;
+                height: 6px;
+                background: #1a1d33;
+            }
+
+            Rectangle {
+                x: 0px;
+                y: 0px;
+                // On the 2px pixel grid.
+                width: Math.round(Math.clamp(root.music-progress, 0, 1) * parent.width / 2px) * 2px;
+                height: 6px;
+                background: #1ed760;
+            }
+
+            PixelText {
+                glyphs: root.music-elapsed;
+                x: 0px;
+                y: 14px;
+            }
+
+            PixelText {
+                glyphs: root.music-length;
+                x: parent.width - self.width;
+                y: 14px;
+            }
+        }
+    }
+
+    // ---- Connecting: black, the Wi-Fi logo lighting up arc by arc, and what's happening ----
+    Timer {
+        interval: 400ms;
+        running: root.connecting && !root.join-failing && !root.setup-mode;
+        triggered => {
+            root.wifi-frame = Math.mod(root.wifi-frame + 1, root.wifi-frames.length);
+        }
+    }
+
+    if root.connecting && !root.setup-mode: Rectangle {
+        background: #000000;
+
+        Image {
+            source: root.join-failing ? @image-url("wifi/off.png") : root.wifi-frames[root.wifi-frame];
+            x: root.centred(self.width);
+            y: 60px;
+        }
+
+        PixelText {
+            glyphs: root.status;
+            x: root.centred(self.width);
+            y: 128px;
+        }
     }
 
     // ---- Wi-Fi setup text (lines in the sky, footer on the ground) ----
