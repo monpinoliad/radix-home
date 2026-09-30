@@ -97,6 +97,8 @@ const BRIGHTNESS: u8 = 100;
 /// Wi-Fi transmit power in 0.25 dBm steps (8..=84). esp-radio starts at 20 (5 dBm), which is weak;
 /// 60 is 15 dBm. Above about 65 some boards fail to authenticate.
 const WIFI_TX_POWER: i8 = 60;
+/// Most Wi-Fi frames held in memory at once, each way (see where the controller is made).
+const WIFI_DYNAMIC_BUFFERS: u16 = 16;
 
 /// `BINS_DEMO=1 ./scripts/flash.sh`: show every bin all the time (even before the clock has
 /// synced), to see how they look.
@@ -175,9 +177,11 @@ async fn main(spawner: Spawner) -> ! {
     let config = esp_hal::Config::default().with_cpu_clock(CpuClock::max());
     let peripherals = esp_hal::init(config);
 
-    // Wi-Fi alone wants ~100 KiB of heap; Slint takes the rest.
+    // Wi-Fi alone wants ~100 KiB of heap; Slint takes the rest. Running, about 147 KiB is in
+    // use and Wi-Fi bursts come on top, so this leaves room (it comes out of the stack, which
+    // gets whatever RAM is left and had far more than it needs).
     esp_alloc::heap_allocator!(#[esp_hal::ram(reclaimed)] size: 73744);
-    esp_alloc::heap_allocator!(size: 112 * 1024);
+    esp_alloc::heap_allocator!(size: 144 * 1024);
 
     let timg0 = TimerGroup::new(peripherals.TIMG0);
     esp_rtos::start(timg0.timer0, peripherals.FROM_CPU_INTR0);
@@ -277,9 +281,15 @@ async fn main(spawner: Spawner) -> ! {
         }
         None => setup::wifi_config(),
     };
+    // Wi-Fi takes a heap buffer (up to ~1.6 KiB) for each frame in flight, 32 each way by
+    // default: a burst could take ~100 KiB at once and crash us out of memory. 16 is plenty for
+    // a few KiB every 10 s. Must stay above `rx_ba_win` (6).
     let mut controller = WifiController::new(
         peripherals.WIFI,
-        ControllerConfig::default().with_initial_config(wifi_config),
+        ControllerConfig::default()
+            .with_dynamic_rx_buf_num(WIFI_DYNAMIC_BUFFERS)
+            .with_dynamic_tx_buf_num(WIFI_DYNAMIC_BUFFERS)
+            .with_initial_config(wifi_config),
     )
     .unwrap();
     // Both for joining the home network and for the setup hotspot. The radio is already started,
