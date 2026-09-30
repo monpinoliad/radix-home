@@ -4,7 +4,7 @@
 //! Runs as embassy tasks next to the UI loop and publishes results into [`snapshot`] (and the
 //! calendar into [`calendar`], what's playing into [`now_playing`]).
 
-use alloc::{format, vec, vec::Vec};
+use alloc::{format, vec::Vec};
 use core::cell::{Cell, RefCell};
 
 use critical_section::Mutex;
@@ -37,10 +37,9 @@ const HA_CALENDARS: &str = env_or_empty(option_env!("HA_CALENDARS"));
 const HA_BIN_CALENDAR: &str = env_or_empty(option_env!("HA_BIN_CALENDAR"));
 /// Entity ID of the media player to show on the now-playing slide, e.g. Spotify's.
 const HA_MEDIA_PLAYER: &str = env_or_empty(option_env!("HA_MEDIA_PLAYER"));
-/// Room for one calendar's reply; a bigger one is a failed fetch.
-const CALENDAR_RESPONSE_MAX: usize = 8 * 1024;
-/// Room for the media player's state (about 1 KiB).
-const MEDIA_RESPONSE_MAX: usize = 4 * 1024;
+/// Room for one Home Assistant reply: a calendar's, or the media player's state (about 1 KiB).
+/// A bigger one is a failed fetch.
+const HA_RESPONSE_MAX: usize = 8 * 1024;
 /// Room for the forecast (about 1.1 KiB).
 const WEATHER_RESPONSE_MAX: usize = 3 * 1024;
 
@@ -196,6 +195,9 @@ pub async fn net_task(mut runner: Runner<'static, Interface>) {
 /// 15 minutes (every 30 s until everything works).
 #[embassy_executor::task]
 pub async fn sync_task(stack: Stack<'static>) {
+    // Part of the task, so in static memory, not taken from the heap on every fetch (where it
+    // could fail to fit when Wi-Fi is busy).
+    let mut response = [0u8; WEATHER_RESPONSE_MAX];
     let mut located: Option<Location> = None;
     loop {
         stack.wait_config_up().await;
@@ -217,7 +219,8 @@ pub async fn sync_task(stack: Stack<'static>) {
         }
 
         // Until the lookup works, show the fallback location's weather rather than none.
-        let forecast = fetch_weather(stack, located.unwrap_or(location::FALLBACK)).await;
+        let forecast =
+            fetch_weather(stack, located.unwrap_or(location::FALLBACK), &mut response).await;
         match forecast {
             Ok(weather) => {
                 log::info!("weather: {weather:?}");
@@ -238,6 +241,9 @@ pub async fn ha_task(stack: Stack<'static>) {
     if !ha_configured() {
         return;
     }
+    // Shared by every fetch here (they take turns). In the task, so in static memory, not
+    // taken from the heap on every fetch (where it could fail to fit when Wi-Fi is busy).
+    let mut response = [0u8; HA_RESPONSE_MAX];
     let mut next_calendar = embassy_time::Instant::now();
     loop {
         stack.wait_config_up().await;
@@ -245,7 +251,7 @@ pub async fn ha_task(stack: Stack<'static>) {
         if embassy_time::Instant::now() >= next_calendar {
             let s = snapshot();
             let fetched = match s.unix_now() {
-                Some(now) => fetch_calendar(stack, now, s.utc_offset_s()).await,
+                Some(now) => fetch_calendar(stack, now, s.utc_offset_s(), &mut response).await,
                 None => Err("clock not synced yet"),
             };
             let wait = match fetched {
@@ -268,7 +274,7 @@ pub async fn ha_task(stack: Stack<'static>) {
         }
 
         if !HA_MEDIA_PLAYER.trim().is_empty() {
-            let playing = fetch_now_playing(stack).await.unwrap_or_else(|e| {
+            let playing = fetch_now_playing(stack, &mut response).await.unwrap_or_else(|e| {
                 // Don't leave a song up that may have stopped long ago.
                 log::warn!("media player fetch failed: {e}");
                 None
@@ -356,7 +362,11 @@ async fn locate(stack: Stack<'_>) -> Result<Location, &'static str> {
     Ok(here)
 }
 
-async fn fetch_weather(stack: Stack<'_>, at: Location) -> Result<Weather, &'static str> {
+async fn fetch_weather(
+    stack: Stack<'_>,
+    at: Location,
+    response: &mut [u8],
+) -> Result<Weather, &'static str> {
     // `timezone=auto`: the local time (and daylight saving) of the coordinates.
     let path = format!(
         "/v1/forecast?latitude={}&longitude={}\
@@ -368,8 +378,7 @@ async fn fetch_weather(stack: Stack<'_>, at: Location) -> Result<Weather, &'stat
         at.longitude,
         weather::HOURS_FETCHED
     );
-    let mut response = vec![0u8; WEATHER_RESPONSE_MAX];
-    let body = http_get(stack, WEATHER_HOST, 80, &path, "", &mut response).await?;
+    let body = http_get(stack, WEATHER_HOST, 80, &path, "", response).await?;
     weather::parse(body).ok_or("weather parse")
 }
 
@@ -380,6 +389,7 @@ async fn fetch_calendar(
     stack: Stack<'_>,
     now: i64,
     utc_offset_s: i32,
+    response: &mut [u8],
 ) -> Result<Calendar, &'static str> {
     let day = calendar::local_day(now, utc_offset_s);
     let midnight = |day: i64| day * 24 * 60 * 60 - i64::from(utc_offset_s);
@@ -392,11 +402,11 @@ async fn fetch_calendar(
         .map(str::trim)
         .filter(|e| !e.is_empty())
     {
-        events.extend(fetch_events(stack, entity, &from, &to).await?);
+        events.extend(fetch_events(stack, entity, &from, &to, response).await?);
     }
     let bin_events = match HA_BIN_CALENDAR.trim() {
         "" => None,
-        entity => Some(fetch_events(stack, entity, &from, &to).await?),
+        entity => Some(fetch_events(stack, entity, &from, &to, response).await?),
     };
     Ok(Calendar {
         day,
@@ -410,18 +420,19 @@ async fn fetch_events(
     entity: &str,
     from: &str,
     to: &str,
+    response: &mut [u8],
 ) -> Result<Vec<Event>, &'static str> {
     let path = format!("/api/calendars/{entity}?start={from}&end={to}");
-    // On the heap: bigger than the other replies, and only needed for a moment.
-    let mut response = vec![0u8; CALENDAR_RESPONSE_MAX];
-    let body = ha_get(stack, &path, &mut response).await?;
+    let body = ha_get(stack, &path, response).await?;
     calendar::parse(body).ok_or("calendar parse")
 }
 
-async fn fetch_now_playing(stack: Stack<'_>) -> Result<Option<NowPlaying>, &'static str> {
+async fn fetch_now_playing(
+    stack: Stack<'_>,
+    response: &mut [u8],
+) -> Result<Option<NowPlaying>, &'static str> {
     let path = format!("/api/states/{}", HA_MEDIA_PLAYER.trim());
-    let mut response = vec![0u8; MEDIA_RESPONSE_MAX];
-    let body = ha_get(stack, &path, &mut response).await?;
+    let body = ha_get(stack, &path, response).await?;
     media::parse(body).ok_or("media player parse")
 }
 
