@@ -26,6 +26,7 @@ use esp_hal::{
     },
     main,
     rng::Rng,
+    rtc_cntl::{Rtc, RwdtStage},
     spi::{Mode, master::Spi},
     time::{Duration, Instant, Rate},
     timer::timg::TimerGroup,
@@ -78,6 +79,10 @@ const ROTATE_180: bool = true;
 const INPUT_POLL_INTERVAL: Duration = Duration::from_millis(20);
 /// How often to push clock, weather, bins and events into the UI.
 const UI_REFRESH_INTERVAL: Duration = Duration::from_millis(250);
+/// The board restarts if the UI loop stops running this long (a hang would freeze the screen).
+const WATCHDOG_TIMEOUT: Duration = Duration::from_secs(30);
+/// How often to log heap use, to spot memory running out over hours.
+const HEAP_LOG_INTERVAL: Duration = Duration::from_secs(60);
 
 /// If the saved network hasn't given us an address this long after boot, open setup instead.
 const CONNECT_GIVE_UP: Duration = Duration::from_secs(60);
@@ -102,6 +107,8 @@ const BINS_DEMO: bool = option_env!("BINS_DEMO").is_some();
 static mut SETUP_REQUEST: u32 = 0;
 const SETUP_REQUEST_MAGIC: u32 = 0x5345_5455; // "SETU"
 
+/// Whether the last boot asked for setup mode. Clears the flag, so it only counts once.
+/// A magic number, not just 1, because this RAM holds garbage after a power cut.
 fn take_setup_request() -> bool {
     // SAFETY: single-threaded access before any tasks run.
     unsafe {
@@ -116,6 +123,7 @@ fn take_setup_request() -> bool {
 #[esp_hal::ram(unstable(rtc_fast, persistent))]
 static mut JOIN_PROBLEM: u32 = 0;
 
+/// Why the last boot gave up on the saved network, if it did. Clears it, so it's shown once.
 fn take_join_problem() -> Option<JoinProblem> {
     // SAFETY: single-threaded access before any tasks run.
     unsafe {
@@ -133,6 +141,7 @@ fn restart_into_setup_after(problem: JoinProblem) -> ! {
     restart(true)
 }
 
+/// Resets the chip, noting in reset-proof RAM whether the next boot should open setup.
 fn restart(into_setup: bool) -> ! {
     // SAFETY: we reset immediately after this write.
     unsafe {
@@ -142,6 +151,15 @@ fn restart(into_setup: bool) -> ! {
     esp_hal::system::software_reset()
 }
 
+/// After a panic (and its backtrace on the serial log), restart instead of halting: halting
+/// leaves the last frame on the panel, a clock frozen at the time of the crash.
+/// esp-backtrace calls this by name (`custom-halt` feature), hence `no_mangle`.
+#[unsafe(no_mangle)]
+fn custom_halt() -> ! {
+    restart(false)
+}
+
+/// The network from `wifi.env` baked in at build time, if one was given and it's valid.
 fn preset_credentials() -> Option<Credentials> {
     Credentials::new(PRESET_SSID?, PRESET_PASSWORD.unwrap_or("")).ok()
 }
@@ -347,9 +365,29 @@ async fn main(spawner: Spawner) -> ! {
     let mut shown = Shown::default();
     let mut shown_status = "";
     let mut slide_show = SlideShow::new();
+    let mut next_heap_log = Instant::now();
+
+    // The RTC watchdog is a hardware countdown: if it reaches zero, it resets the chip. Each
+    // pass of the loop below "feeds" it (restarts the countdown), so it only fires when the
+    // loop is stuck, e.g. a task never yields or something spins forever.
+    let mut rtc = Rtc::new(peripherals.RTC_TIMER);
+    rtc.rwdt.set_timeout(RwdtStage::Stage0, WATCHDOG_TIMEOUT);
+    rtc.rwdt.enable();
 
     loop {
+        rtc.rwdt.feed();
         slint::platform::update_timers_and_animations();
+
+        // "used" creeping up over hours means a leak; "free" high but crashes anyway points
+        // to fragmentation (no single gap big enough for the allocation).
+        if Instant::now() >= next_heap_log {
+            next_heap_log = Instant::now() + HEAP_LOG_INTERVAL;
+            log::info!(
+                "heap: {} used, {} free",
+                esp_alloc::HEAP.used(),
+                esp_alloc::HEAP.free()
+            );
+        }
 
         // Every pass, not just every UI refresh, so a slide moves smoothly.
         if !setup_mode {
@@ -425,10 +463,12 @@ fn show_bins(app: &AppWindow, due: [bool; bins::BINS.len()]) {
     app.set_bins(ModelRc::new(VecModel::from(indices)));
 }
 
+/// Text as the glyph indices the UI's pixel font draws.
 fn pixel_text(text: &str) -> ModelRc<i32> {
     ModelRc::new(VecModel::from(setup::glyphs(text)))
 }
 
+/// Fills the setup screen: four lines and a footer.
 fn show_setup_text(app: &AppWindow, lines: [&str; 4], footer: &str) {
     app.set_setup_line_1(pixel_text(lines[0]));
     app.set_setup_line_2(pixel_text(lines[1]));
@@ -446,6 +486,7 @@ struct SlideShow {
 }
 
 impl SlideShow {
+    /// Starts on the clock, nothing moving.
     fn new() -> Self {
         Self {
             current: Slide::Clock,
@@ -509,6 +550,7 @@ const FORECAST_COLUMNS: usize = 4;
 const FORECAST_STEP_HOURS: usize = 3;
 
 impl ForecastView {
+    /// Today's icon, high/low and rain chance, and the next few hours from `now`.
     fn new(forecast: &Weather, now: i64) -> Self {
         let degrees = |c: f32| format!("{}°", weather::round_c(c));
         Self {
@@ -531,6 +573,7 @@ impl ForecastView {
         }
     }
 
+    /// Puts this forecast on the forecast slide.
     fn show(&self, app: &AppWindow) {
         app.set_forecast_icon(self.icon);
         app.set_forecast_range(pixel_text(&self.range));
@@ -565,6 +608,7 @@ struct Shown {
 }
 
 impl Shown {
+    /// Whether a slide has anything to show; empty ones are skipped. The clock always does.
     fn has_content(&self, slide: Slide) -> bool {
         match slide {
             Slide::Clock => true,
@@ -575,6 +619,7 @@ impl Shown {
     }
 }
 
+/// Event or agenda lines as the UI's list model, in pixel text.
 fn event_lines(lines: &[Line]) -> ModelRc<EventLine> {
     let lines: Vec<EventLine> = lines
         .iter()
@@ -709,11 +754,13 @@ fn refresh_music(app: &AppWindow, shown: &mut Shown, snapshot: &net::Snapshot, n
     }
 }
 
+/// Hooks Slint up to this board: one window (drawn line by line to the panel) and the clock.
 struct EspBackend {
     window: Rc<MinimalSoftwareWindow>,
 }
 
 impl slint::platform::Platform for EspBackend {
+    // The single window every Slint component is shown in.
     fn create_window_adapter(
         &self,
     ) -> Result<Rc<dyn slint::platform::WindowAdapter>, slint::PlatformError> {

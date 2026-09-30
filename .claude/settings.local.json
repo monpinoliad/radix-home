@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Read(///wsl.localhost/Ubuntu/home/monpinoliad/**)",
+      "Bash(perl -0pi -e 's|\\(    save\\\\\\(&window, &format!\\\\\\(\"out/7_loading\\\\{suffix\\\\}.png\"\\\\\\)\\\\\\);\\\\n\\)|$1\\\\n    // No bins: the events line sits lower; with no events either, the clock group moves down.\\\\n    app.set_time_valid\\(true\\);\\\\n    app.set_weather_valid\\(true\\);\\\\n    app.set_bins\\(ModelRc::new\\(VecModel::from\\(Vec::<i32>::new\\(\\)\\)\\)\\);\\\\n    save\\(\\\\&window, \\\\&format!\\(\"out/8_events_only{suffix}.png\"\\)\\);\\\\n    app.set_events\\(ModelRc::new\\(VecModel::from\\(Vec::<EventLine>::new\\(\\)\\)\\)\\);\\\\n    save\\(\\\\&window, \\\\&format!\\(\"out/9_nothing{suffix}.png\"\\)\\);\\\\n|' src/main.rs)",
+      "Bash(wsl.exe -d Ubuntu -- bash -lc 'cd ~/radix-preview && touch build.rs && cargo +stable run --release -q 2>&1 | grep -E \"error|-->|out/[089]_\"')",
+      "Bash(wsl.exe -d Ubuntu -- bash -lc 'cd ~/projects/radix-home && bash target/b.sh; rm target/b.sh')"
+    ]
+  }
+}
